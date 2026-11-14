@@ -176,7 +176,7 @@
     <ul>
       <li>This page is the phone camera view. On a computer it asks you to open it on your phone. The first tap anywhere starts the camera, motion, and location. On iPhone that tap is what allows motion. There is no AR button.</li>
       <li>iPhone Safari has no WebXR AR, so on iOS this uses camera passthrough + compass (iOS 13+ asks for Motion permission). Android Chrome uses WebXR <code>immersive-ar</code> when supported.</li>
-      <li>Compass accuracy varies. On iPhone, heading is <code>webkitCompassHeading</code> (magnetic) plus declination. If accuracy is below 0 or worse than 20°, calibrate with a figure-8. Point the reticle at the real Pad 1 tower and tap <b>Align to tower</b>. The offset is saved on this phone.</li>
+      <li>Heading uses the phone’s motion sensors (W3C device orientation, back-camera look direction). A one-shot <code>webkitCompassHeading</code> (magnetic, plus the east declination below) may seed the yaw; after that the compass is frozen so tilting does not change heading. Point the reticle at the real Pad 1 tower and tap Align to lock true bearing — that offset is a world-yaw rotation, not an Euler tweak. If the figure-8 hint appears before you align, move the phone to calibrate the magnetometer.</li>
       <li>Declination is a south-Texas constant of <b>+2.5° E</b> (true = magnetic + east declination), not a full World Magnetic Model run. Edit it if you are somewhere else. It is applied only to the magnetic compass, not to <code>deviceorientationabsolute</code>.</li>
       <li>The portrait vertical field of view defaults to 63°, a typical iPhone 1× rear camera. Adjust it if the tower doesn't match the video.</li>
       <li>Earth curvature is included in az/el; atmospheric refraction is not.</li>
@@ -514,40 +514,56 @@ function enuDist(s){const v=enu(s.lat,s.lon,0);return Math.hypot(v.x,v.z);}
 // ---------------------------------------------------------------- AR (camera passthrough + compass) & WebXR
 let arMode=null; // null | 'pass' | 'xr'
 const video=$('video');
-let compassLocked=false; let ori=null, absOri=false, compassOffset=null, manualOffset=0, pitchOffset=0, lastCompass=null, compassAcc=null;
-const zee=new THREE.Vector3(0,0,1), q1=new THREE.Quaternion(-Math.sqrt(0.5),0,0,Math.sqrt(0.5)), eul=new THREE.Euler(), q0=new THREE.Quaternion();
-const qTarget=new THREE.Quaternion(), qSmooth=new THREE.Quaternion();
+let compassLocked=false, compassFrozen=false, pendingCompassSnap=false;
+let ori=null, absOri=false, compassOffset=null, manualOffset=0, pitchOffset=0, lastCompass=null, compassAcc=null;
+const zee=new THREE.Vector3(0,0,1), yUp=new THREE.Vector3(0,1,0), xRight=new THREE.Vector3(1,0,0);
+const q1=new THREE.Quaternion(-Math.sqrt(0.5),0,0,Math.sqrt(0.5)), eul=new THREE.Euler(), q0=new THREE.Quaternion(), qYaw=new THREE.Quaternion();
+const qTarget=new THREE.Quaternion(), qDevice=new THREE.Quaternion();
 let qReady=false;
 try{
   const hs=localStorage.getItem('f15-hdg'), ps=localStorage.getItem('f15-pitch'), fs=localStorage.getItem('f15-fov');
-  if(hs!=null&&hs!=='')manualOffset=+hs||0;
+  if(hs!=null&&hs!==''){manualOffset=+hs||0; if(manualOffset){compassFrozen=true;compassLocked=true;}}
   if(ps!=null&&ps!=='')pitchOffset=+ps||0;
   if(fs){$('fovInput').value=fs;}
 }catch(e){}
 function saveTune(){try{localStorage.setItem('f15-hdg',String(manualOffset));localStorage.setItem('f15-pitch',String(pitchOffset));localStorage.setItem('f15-fov',$('fovInput').value);}catch(e){}}
 function declEast(){const v=+$('declInput').value;return Number.isFinite(v)?v:DECL_TX;}
-function onOri(e){ if(e.alpha==null)return; ori={a:e.alpha,b:e.beta,g:e.gamma,mag:false};
-  // webkitCompassHeading is magnetic. Add east declination to get true heading.
-  if(typeof e.webkitCompassHeading==='number'&&e.webkitCompassHeading>=0&&!absOri){
-    const hdg=(e.webkitCompassHeading+declEast()+360)%360; lastCompass=hdg; compassAcc=typeof e.webkitCompassAccuracy==='number'?e.webkitCompassAccuracy:null; ori.mag=true;
-    let off=((360-hdg)-e.alpha+720)%360;
-    if(compassOffset==null)compassOffset=off; else if(!compassLocked){let d=((off-compassOffset+540)%360)-180; compassOffset=(compassOffset+d*0.08+360)%360;}
-  }}
-function onAbs(e){ if(e.alpha==null)return; absOri=true; ori={a:e.alpha,b:e.beta,g:e.gamma,mag:false}; compassOffset=0; lastCompass=(360-e.alpha)%360; compassAcc=null; }
 function screenAngle(){const s=screen.orientation&&typeof screen.orientation.angle==='number'?screen.orientation.angle:window.orientation;return +s||0;}
+// Standard W3C ZXY → three.js DeviceOrientationControls: Euler YXZ, −90° X (look out the back camera, −Z), then screen.orientation.
+function deviceQuat(alpha,beta,gamma,orient,out){
+  eul.set(beta*D2R,alpha*D2R,-gamma*D2R,'YXZ');
+  out.setFromEuler(eul);
+  out.multiply(q1);
+  out.multiply(q0.setFromAxisAngle(zee,-orient*D2R));
+  return out;
+}
+function headingOf(q){const d=new THREE.Vector3(0,0,-1).applyQuaternion(q);return (Math.atan2(d.x,-d.z)*R2D+360)%360;}
+function onOri(e){ if(e.alpha==null)return; ori={a:e.alpha,b:e.beta,g:e.gamma,mag:false};
+  if(typeof e.webkitCompassHeading==='number'&&e.webkitCompassHeading>=0){
+    const hdg=(e.webkitCompassHeading+declEast()+360)%360; lastCompass=hdg; compassAcc=typeof e.webkitCompassAccuracy==='number'?e.webkitCompassAccuracy:null; ori.mag=true;
+    // One-shot only: never keep easing Euler alpha toward the compass (that bleeds pitch into yaw).
+    if(!compassLocked&&!compassFrozen)pendingCompassSnap=true;
+  }}
+function onAbs(e){ if(e.alpha==null)return; ori={a:e.alpha,b:e.beta,g:e.gamma,mag:false}; lastCompass=(360-e.alpha)%360; compassAcc=null; absOri=true; }
 function applyOrientation(cam,dt){ if(!ori)return;
-  const a=(ori.a+(compassOffset||0)+manualOffset)*D2R, b=(ori.b+pitchOffset)*D2R, g=ori.g*D2R, o=screenAngle()*D2R;
-  // Same ZXY-device conversion as three.js DeviceOrientationControls: Euler YXZ, then -90° X, then screen yaw.
-  eul.set(b,a,-g,'YXZ'); qTarget.setFromEuler(eul); qTarget.multiply(q1); qTarget.multiply(q0.setFromAxisAngle(zee,-o));
-  const k=1-Math.exp(-(dt||0.016)/0.12);
-  if(!qReady){qSmooth.copy(qTarget);qReady=true;} else qSmooth.slerp(qTarget,k);
-  cam.quaternion.copy(qSmooth); }
+  deviceQuat(ori.a,ori.b,ori.g,screenAngle(),qDevice);
+  qTarget.copy(qDevice);
+  if(pitchOffset)qTarget.multiply(q0.setFromAxisAngle(xRight,pitchOffset*D2R));
+  if(pendingCompassSnap&&lastCompass!=null&&!compassLocked&&!compassFrozen){
+    manualOffset=wrap180(lastCompass-headingOf(qTarget));
+    compassFrozen=true; pendingCompassSnap=false; saveTune();
+  }
+  // Heading calibration is a pure world-yaw, multiplied on the left — never added to Euler alpha.
+  // rotY(+φ) decreases camAz by φ, so use −manualOffset to make +offset increase TRUE HDG.
+  qTarget.premultiply(qYaw.setFromAxisAngle(yUp,-manualOffset*D2R));
+  cam.quaternion.copy(qTarget); qReady=true;
+}
 function updateArFov(){ if(arMode!=='pass')return;
-  const vPort=((+$('fovInput').value)||63)*D2R, ang=((screenAngle()%180)+180)%180, portrait=ang===0;
-  let vfov=portrait?vPort:2*Math.atan(Math.tan(vPort/2)*(innerHeight/Math.max(1,innerWidth)));
-  if(video.videoWidth&&video.videoHeight){const screenA=innerWidth/innerHeight, videoA=video.videoWidth/video.videoHeight;
-    if(videoA<screenA)vfov=2*Math.atan(Math.tan(vfov/2)*(screenA/videoA));}
-  camera.fov=vfov*R2D; camera.updateProjectionMatrix(); }
+  // fovInput is the portrait *vertical* field of view (1× ≈ 63°). three.js camera.fov is also vertical.
+  const vPort=((+$('fovInput').value)||63), ang=((screenAngle()%180)+180)%180, portrait=ang===0;
+  camera.aspect=innerWidth/Math.max(1,innerHeight);
+  camera.fov=portrait?vPort:(2*Math.atan(Math.tan(vPort*D2R/2)*(innerHeight/Math.max(1,innerWidth)))*R2D);
+  camera.updateProjectionMatrix(); }
 $('fovInput').addEventListener('change',()=>{saveTune();updateArFov();});
 function camAz(cam){const d=new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);return (Math.atan2(d.x,-d.z)*R2D+360)%360;}
 function camEl(cam){const d=new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);return Math.asin(Math.max(-1,Math.min(1,d.y)))*R2D;}
@@ -565,21 +581,23 @@ function doAlign(){
   const L=LANDMARKS[$('lmSel').value]||LANDMARKS.tower, t=lmLook();
   if(arMode==='xr'){alignXR(t.az);return;}
   if(!ori){toast('No motion data yet – tap the screen first and allow Motion.');return;}
-  compassLocked=true; // freeze compass tracking so the alignment can't drift away
-  manualOffset+=wrap180(camAz(camera)-t.az);
-  if($('lmPitch').checked)pitchOffset+=t.el-camEl(camera);
-  qReady=false; saveTune();
-  toast(`Aligned on ${L.name}: true bearing ${t.az.toFixed(1)}°. Compass locked (gyro only).`,4500);}
+  applyOrientation(camera,1);
+  compassLocked=true; compassFrozen=true; pendingCompassSnap=false;
+  // Offset is now in TRUE HDG degrees (world yaw), so add target minus current.
+  manualOffset+=wrap180(t.az-camAz(camera));
+  if($('lmPitch').checked){applyOrientation(camera,1);pitchOffset+=t.el-camEl(camera);}
+  applyOrientation(camera,1); saveTune();
+  toast(`Aligned on ${L.name}: true bearing ${t.az.toFixed(1)}°. Heading locked.`,4500);}
 $('btnAlign').onclick=doAlign; $('btnAlign2').onclick=doAlign;
-$('btnN1m').onclick=()=>nudge(1,0); $('btnN1p').onclick=()=>nudge(-1,0);
-$('btnN5m').onclick=()=>nudge(5,0); $('btnN5p').onclick=()=>nudge(-5,0);
-$('btnReset').onclick=()=>{manualOffset=0;pitchOffset=0;compassLocked=false;compassOffset=null;qReady=false;const sl=$('nudgeSlide');if(sl){sl._last=0;sl.value=0;}if($('nudgeVal'))$('nudgeVal').textContent='0°';saveTune();toast('Calibration reset – following compass again');};
+$('btnN1m').onclick=()=>nudge(-1,0); $('btnN1p').onclick=()=>nudge(1,0);
+$('btnN5m').onclick=()=>nudge(-5,0); $('btnN5p').onclick=()=>nudge(5,0);
+$('btnReset').onclick=()=>{manualOffset=0;pitchOffset=0;compassLocked=false;compassFrozen=false;pendingCompassSnap=false;compassOffset=null;qReady=false;const sl=$('nudgeSlide');if(sl){sl._last=0;sl.value=0;}if($('nudgeVal'))$('nudgeVal').textContent='0°';saveTune();toast('Calibration reset – one-shot compass on next reading');};
 (function(){const sl=$('nudgeSlide');sl._last=0;sl.oninput=()=>{const v=+sl.value;nudge(v-(sl._last||0),0);sl._last=v;$('nudgeVal').textContent=v.toFixed(1)+'°';};})();
 $('btnSeat').onclick=()=>{stopGps();gpsEst=null;gpsBuilt=null;setOrigin({lat:25.963842,lon:-97.205638,h:0.002,label:'Boca Chica Blvd seat'});buildWorld();camera.position.set(0,0.002,0);$('viewerTxt').textContent='Seat 25.963842, −97.205638';$('rGps').textContent='Seat';};
-$('btnL5').onclick=()=>nudge(0.5,0);
-$('btnL').onclick=()=>nudge(2,0);
-$('btnR').onclick=()=>nudge(-2,0);
-$('btnR5').onclick=()=>nudge(-0.5,0);
+$('btnL5').onclick=()=>nudge(-0.5,0);
+$('btnL').onclick=()=>nudge(-2,0);
+$('btnR').onclick=()=>nudge(2,0);
+$('btnR5').onclick=()=>nudge(0.5,0);
 $('btnPup').onclick=()=>nudge(0,0.5);
 $('btnPdn').onclick=()=>nudge(0,-0.5);
 
@@ -690,8 +708,10 @@ function frame(now){
   $('tlabel').textContent=`T+${fmtHMS(LIFTOFF_T+tc)} · ${fmtT(tc)}`;
   if(arMode==='pass'){applyOrientation(camera,dt);
     const accTxt=compassAcc==null?'?':(compassAcc<0?'unreliable':`±${Math.round(compassAcc)}°`);
-    $('trueHdg').textContent=`TRUE HDG ${camAz(camera).toFixed(0)}° · tilt ${camEl(camera).toFixed(0)}°`+(compassLocked?' · 🔒':' · compass');$('hdgTxt').textContent=`offset ${manualOffset.toFixed(1)}° · pitch ${pitchOffset.toFixed(1)}° · compass ${absOri?'absolute':accTxt}`;
-    const poor=!absOri&&(compassAcc==null||compassAcc<0||compassAcc>20);
+    const locked=compassLocked||compassFrozen;
+    $('trueHdg').textContent=`TRUE HDG ${camAz(camera).toFixed(0)}° · tilt ${camEl(camera).toFixed(0)}°`+(locked?' · 🔒':' · compass');
+    $('hdgTxt').textContent=`offset ${manualOffset.toFixed(1)}° · pitch ${pitchOffset.toFixed(1)}° · compass ${absOri?'absolute':accTxt}`;
+    const poor=!locked&&!absOri&&(compassAcc==null||compassAcc<0||compassAcc>20);
     $('calhint').style.display=poor?'block':'none';
   } else $('calhint').style.display='none';
   if(arMode==='xr'&&xrNeedsYaw&&absOri&&lastCompass!=null){const xc=renderer.xr.getCamera();if(xc){xrNeedsYaw=false;alignXR(lastCompass);}}
@@ -893,7 +913,8 @@ async function loadClouds(){
 $('btnClouds').onclick=e=>{e.stopPropagation();loadClouds();};
 loadClouds();
 
-window.__f15={SAMPLES,sampleAt,EVENTS,phone:PHONE,get clouds(){return cloudState;},loadClouds};
+window.__f15={SAMPLES,sampleAt,EVENTS,phone:PHONE,get clouds(){return cloudState;},loadClouds,camera,camAz,camEl,applyOrientation,deviceQuat,updateArFov,get offsets(){return {manualOffset,pitchOffset,compassLocked,compassFrozen,pendingCompassSnap,arMode};},
+  project(x,y,z){const v=new THREE.Vector3(x,y,z).project(camera);return {x:v.x,y:v.y,z:v.z};}};
 
 </script>
 </body>
