@@ -114,6 +114,15 @@
     #hud{top:calc(env(safe-area-inset-top,0px) + 32px);left:calc(max(6px,env(safe-area-inset-left,0px)) + 100px);font-size:10px}
     #hud .big{font-size:11px}
   }
+
+  #cloudPanel{position:absolute;z-index:5;left:calc(6px + env(safe-area-inset-left));bottom:calc(50px + env(safe-area-inset-bottom));padding:6px 8px;max-width:min(220px,48vw);font-family:var(--f-num);font-size:11px;line-height:1.35;color:var(--fg)}
+  #cloudPanel .ct{font-family:var(--f-label);font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:11px;color:var(--dim)}
+  #cloudPanel #cloudNums{margin:.15em 0 0}
+  #cloudPanel #cloudHour{color:var(--dim);font-size:10px}
+  #cloudPanel .break{color:#9effc2;font-family:var(--f-label);font-weight:700;letter-spacing:.02em;text-transform:none;margin:.25em 0 .1em}
+  #cloudPanel .caveat{color:var(--dim);font-family:var(--f-label);font-size:10px;letter-spacing:.02em;text-transform:none;margin:0 0 .4em}
+  #cloudPanel button{min-height:28px;padding:3px 7px;font-size:11px;width:100%}
+  @media (max-width:560px){#cloudPanel{max-width:min(200px,46vw);font-size:10px}}
 </style>
 <script type="importmap">
 { "imports": {
@@ -171,6 +180,7 @@
       <li>Declination is a south-Texas constant of <b>+2.5° E</b> (true = magnetic + east declination), not a full World Magnetic Model run. Edit it if you are somewhere else. It is applied only to the magnetic compass, not to <code>deviceorientationabsolute</code>.</li>
       <li>The portrait vertical field of view defaults to 63°, a typical iPhone 1× rear camera. Adjust it if the tower doesn't match the video.</li>
       <li>Earth curvature is included in az/el; atmospheric refraction is not.</li>
+      <li>Cloud layers on the path come from an Open-Meteo forecast (low / mid / high cover, plus pressure-level cover when available) at the hour nearest catch. Grey path = likely hidden in or above >50% cloud; bright path = below those layers. This is a forecast, not live radar.</li>
     </ul>
     <h4>Bearings</h4>
     <div class="livebits">
@@ -206,6 +216,14 @@
     <button id="btnSeat" type="button">Viewer = my seat</button>
     <label style="display:flex;align-items:center;gap:6px">Nudge <input id="nudgeSlide" type="range" min="-30" max="30" step="0.5" value="0" style="width:140px"> <span id="nudgeVal">0°</span></label>
     <span id="hdgTxt"></span>
+  </div>
+  <div id="cloudPanel" class="panel p">
+    <div class="ct">Clouds along return</div>
+    <div id="cloudNums">L — · M — · H —</div>
+    <div id="cloudHour">Loading forecast…</div>
+    <div id="cloudBreak" class="break">—</div>
+    <div class="caveat">Forecast, not live radar</div>
+    <button id="btnClouds" type="button">Refresh clouds</button>
   </div>
   <div id="bottom" class="panel p">
     <button id="btnPlay" type="button">▶</button>
@@ -366,6 +384,8 @@ scene.add(new THREE.HemisphereLight(0xbfd8ff,0x3a3020,1.6));
 const sun=new THREE.DirectionalLight(0xffffff,1.6); sun.position.set(-50,80,40); scene.add(sun);
 const world=new THREE.Group(); scene.add(world);          // everything geo-referenced
 let groundGroup, pathGroup, labelGroup, shipObj;
+let pathMeta=null, cloudState=null;
+const CLOUD_THRESH=50, CLOUD_RANGE_KM=150;
 const controls=new OrbitControls(camera,canvas); controls.enableDamping=true; controls.maxDistance=4000; controls.minDistance=0.05;
 
 function makeLabel(text,color='#fff',size=1){
@@ -397,9 +417,9 @@ function buildWorld(){
   const arms=new THREE.Mesh(new THREE.BoxGeometry(0.09,0.006,0.018),new THREE.MeshBasicMaterial({color:'#F84D1E'}));arms.position.copy(tw).add(new THREE.Vector3(0,CATCH_H,0));world.add(arms);
   const towerLab=makeLabel('Pad 1 tower','#F84D1E',1.1);towerLab.position.copy(tw).add(new THREE.Vector3(0,CATCH_H+0.04,0));labelGroup.add(towerLab);
   // trajectory points
-  const pts=[],cols=[],step=4; // every 2 s
-  for(let i=0;i<SAMPLES.length;i+=step){const s=SAMPLES[i];if(s.t>0)break;pts.push(enu(s.lat,s.lon,s.h));cols.push(machColor(s.v/soundSpeed(s.h)));}
-  pts.push(enu(SITES.tower.lat,SITES.tower.lon,CATCH_H)); cols.push(machColor(0));
+  const pts=[],cols=[],pathTimes=[],step=4; // every 2 s
+  for(let i=0;i<SAMPLES.length;i+=step){const s=SAMPLES[i];if(s.t>0)break;pts.push(enu(s.lat,s.lon,s.h));cols.push(machColor(s.v/soundSpeed(s.h)).clone());pathTimes.push(s.t);}
+  pts.push(enu(SITES.tower.lat,SITES.tower.lon,CATCH_H)); cols.push(machColor(0).clone()); pathTimes.push(0);
   // tube
   const curve=new THREE.CatmullRomCurve3(pts,false,'centripetal');
   const segs=1400, tube=new THREE.TubeGeometry(curve,segs,0.14,8,false);
@@ -425,6 +445,8 @@ function buildWorld(){
   shipObj=new THREE.Group();const sd=dotSprite('#ffe7b0',0.09);shipObj.add(sd);const sl=makeLabel('SHIP','#F84D1E',1.15);sl.position.y=0;shipObj.add(sl);shipObj.userData.label=sl;
   const sphere=new THREE.Mesh(new THREE.SphereGeometry(0.16,16,12),new THREE.MeshBasicMaterial({color:'#F84D1E'}));sphere.visible=false;shipObj.add(sphere);world.add(shipObj);
   refreshHorizon();
+  pathMeta={times:pathTimes,mach:cols.map(c=>c.clone()),segs,Ltot,cum:cum.slice()};
+  applyCloudVisuals();
 }
 buildWorld();
 
@@ -439,7 +461,7 @@ let t=-200, playing=false, rate=1, live=false;
 let catchEpoch=Date.UTC(2026,10,14,21,20,10);
 function parseCatch(){const m=$('catchInput').value.trim().match(/^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?$/);if(!m)return;
   catchEpoch=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4]+6,+m[5],+(m[6]||0));} // CT = UTC-6 (CST)
-$('catchInput').addEventListener('change',parseCatch);
+$('catchInput').addEventListener('change',()=>{parseCatch();loadClouds();});
 {const hp=new URLSearchParams(location.hash.slice(1));if(hp.has('t'))t=+hp.get('t');}
 const fmtCT=ms=>new Date(ms).toLocaleTimeString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',second:'2-digit'});
 function fmtT(s){const a=Math.abs(s),m=Math.floor(a/60),ss=Math.floor(a%60);return (s<0?'−':'+')+m+':'+String(ss).padStart(2,'0');}
@@ -691,7 +713,188 @@ function fmtHMS(x){x=Math.max(0,x);const h=Math.floor(x/3600),m=Math.floor(x%360
 renderer.setAnimationLoop(frame);
 addEventListener('resize',()=>{renderer.setSize(innerWidth,innerHeight,false);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();
   const line=pathGroup.getObjectByName('line');if(line)line.material.resolution.set(innerWidth,innerHeight);updateArFov();});
-window.__f15={SAMPLES,sampleAt,EVENTS,phone:PHONE};
+
+// ---------------------------------------------------------------- cloud forecast (Open-Meteo, not live radar)
+function gcKm(a,b){const p1=a.lat*D2R,p2=b.lat*D2R,dlat=p2-p1,dlon=(b.lon-a.lon)*D2R;
+  const x=Math.sin(dlat/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dlon/2)**2;return 2*6371*Math.asin(Math.min(1,Math.sqrt(x)));}
+function cloudQueryPoints(){
+  const tower={lat:SITES.tower.lat,lon:SITES.tower.lon}, along=[];
+  for(const s of SAMPLES){if(s.t>0)break;if(gcKm(s,tower)<=CLOUD_RANGE_KM)along.push(s);}
+  const pts=[];
+  const n=6;
+  if(along.length){for(let i=0;i<n;i++){const s=along[Math.round(i*(along.length-1)/Math.max(1,n-1))];pts.push({lat:+s.lat.toFixed(4),lon:+s.lon.toFixed(4)});}}
+  pts.push({lat:+ORIGIN.lat.toFixed(4),lon:+ORIGIN.lon.toFixed(4)});
+  pts.push({lat:+tower.lat.toFixed(4),lon:+tower.lon.toFixed(4)});
+  const seen=new Set();return pts.filter(p=>{const k=p.lat+','+p.lon;if(seen.has(k))return false;seen.add(k);return true;});
+}
+function chicagoHourMs(iso){const [d,t]=iso.split('T'),[Y,M,D]=d.split('-').map(Number),[h,m]=(t||'0:0').split(':').map(Number);return Date.UTC(Y,M-1,D,h+6,m||0);}
+function nearestHourIndex(times,epoch){let best=0,bd=Infinity;for(let i=0;i<times.length;i++){const d=Math.abs(chicagoHourMs(times[i])-epoch);if(d<bd){bd=d;best=i;}}return best;}
+function takeHour(hourly,idx){const o={};if(!hourly)return o;for(const k of Object.keys(hourly)){if(k==='time')continue;const a=hourly[k];o[k]=Array.isArray(a)?a[idx]:a;}return o;}
+function parseClouds(raw,queryPts){
+  const arr=Array.isArray(raw)?raw:(raw&&raw.hourly?[raw]:[]);
+  if(!arr.length)throw new Error('no forecast');
+  const times=arr[0].hourly&&arr[0].hourly.time;if(!times||!times.length)throw new Error('no hours');
+  const hi=nearestHourIndex(times,catchEpoch), iso=times[hi];
+  const points=arr.map((item,i)=>{
+    const v=takeHour(item.hourly,hi);
+    const lat=item.latitude!=null?item.latitude:(queryPts[i]&&queryPts[i].lat);
+    const lon=item.longitude!=null?item.longitude:(queryPts[i]&&queryPts[i].lon);
+    const z1000=(v.geopotential_height_1000hPa??110)/1000;
+    const z850=(v.geopotential_height_850hPa??1500)/1000;
+    const z700=(v.geopotential_height_700hPa??3100)/1000;
+    const z500=(v.geopotential_height_500hPa??5800)/1000;
+    const z300=(v.geopotential_height_300hPa??9500)/1000;
+    const lowTop=(z850+z700)/2, midTop=(z500+z300)/2, highTop=Math.max(12,z300+2.5);
+    const bands=[
+      {name:'low',lo:0,hi:lowTop,cover:+(v.cloud_cover_low??0)},
+      {name:'mid',lo:lowTop,hi:midTop,cover:+(v.cloud_cover_mid??0)},
+      {name:'high',lo:midTop,hi:highTop,cover:+(v.cloud_cover_high??0)}
+    ];
+    const levs=[[1000,z1000,v.cloud_cover_1000hPa],[850,z850,v.cloud_cover_850hPa],[700,z700,v.cloud_cover_700hPa],[500,z500,v.cloud_cover_500hPa],[300,z300,v.cloud_cover_300hPa]];
+    const zs=levs.filter(L=>L[2]!=null&&L[2]!==undefined).map(L=>[L[1],+L[2]]).sort((a,b)=>a[0]-b[0]);
+    for(let i=0;i<zs.length;i++){
+      const lo=i===0?Math.max(0,zs[i][0]-0.6):(zs[i][0]+zs[i-1][0])/2;
+      const hi=i===zs.length-1?zs[i][0]+2:(zs[i][0]+zs[i+1][0])/2;
+      bands.push({name:'p'+Math.round(zs[i][0]*10),lo,hi,cover:zs[i][1]});
+    }
+    return {lat,lon,low:+(v.cloud_cover_low??0),mid:+(v.cloud_cover_mid??0),high:+(v.cloud_cover_high??0),total:+(v.cloud_cover??0),bands,z850,z700,z500,z300};
+  });
+  return {iso,points};
+}
+function interpCloud(lat,lon){
+  if(!cloudState||!cloudState.points.length)return null;
+  const pts=cloudState.points;
+  let wSum=0,low=0,mid=0,high=0;
+  const bandAcc=[];
+  let nearest=pts[0],nd=Infinity;
+  for(const p of pts){
+    const d=Math.max(gcKm({lat,lon},p),0.05), w=1/(d*d);
+    if(d<nd){nd=d;nearest=p;}
+    wSum+=w;low+=p.low*w;mid+=p.mid*w;high+=p.high*w;
+    for(const b of p.bands){
+      let a=bandAcc.find(x=>x.name===b.name);
+      if(!a){a={name:b.name,lo:0,hi:0,cover:0,w:0};bandAcc.push(a);}
+      a.lo+=b.lo*w;a.hi+=b.hi*w;a.cover+=b.cover*w;a.w+=w;
+    }
+  }
+  const bands=bandAcc.map(a=>({name:a.name,lo:a.lo/a.w,hi:a.hi/a.w,cover:a.cover/a.w}));
+  return {low:low/wSum,mid:mid/wSum,high:high/wSum,bands,nearest};
+}
+function shipHidden(s){
+  const c=interpCloud(s.lat,s.lon);if(!c)return {hidden:false,base:null,c:null};
+  const sig=c.bands.filter(b=>b.cover>CLOUD_THRESH);
+  if(!sig.length)return {hidden:false,base:null,c};
+  const base=Math.min(...sig.map(b=>b.lo));
+  return {hidden:s.h>=base-0.01,base,c};
+}
+function findBreakthrough(){
+  if(!cloudState)return {kind:'none'};
+  const tower={lat:SITES.tower.lat,lon:SITES.tower.lon};
+  let breakS=null, sawHidden=false, lastBase=null;
+  for(const s of SAMPLES){
+    if(s.t>0)break;
+    if(gcKm(s,tower)>CLOUD_RANGE_KM+10)continue;
+    const r=shipHidden(s);
+    if(r.base!=null)lastBase=r.base;
+    if(r.hidden)sawHidden=true;
+    if(sawHidden&&!r.hidden&&!breakS)breakS=s;
+  }
+  if(!sawHidden)return {kind:'clear'};
+  if(breakS)return {kind:'break',s:breakS};
+  return {kind:'hidden',base:lastBase};
+}
+function applyCloudVisuals(){
+  if(!pathGroup||!pathMeta)return;
+  const old=pathGroup.getObjectByName('cloudOverlay');
+  if(old)pathGroup.remove(old);
+  const tube=pathGroup.getObjectByName('tube'), line=pathGroup.getObjectByName('line');
+  const {times,mach,segs,Ltot,cum}=pathMeta;
+  const hiddenAt=i=>{
+    if(!cloudState)return false;
+    const s=sampleAt(times[i]??0);
+    return shipHidden(s).hidden;
+  };
+  const grey=new THREE.Color('#6a6e75');
+  if(tube&&tube.geometry&&tube.geometry.attributes.color){
+    const colorArr=tube.geometry.attributes.color.array;
+    for(let i=0;i<=segs;i++){
+      const target=i/segs*Ltot;let lo=0,hi=cum.length-1;while(hi-lo>1){const mid=(lo+hi)>>1;if(cum[mid]<target)lo=mid;else hi=mid;}
+      const c=cloudState&&hiddenAt(lo)?grey:mach[lo];
+      for(let j=0;j<=8;j++){const idx=(i*9+j)*3;colorArr[idx]=c.r;colorArr[idx+1]=c.g;colorArr[idx+2]=c.b;}
+    }
+    tube.geometry.attributes.color.needsUpdate=true;
+  }
+  if(line&&line.geometry&&typeof line.geometry.setColors==='function'){
+    const cols=[];
+    for(let i=0;i<mach.length;i++){const c=cloudState&&hiddenAt(i)?grey:mach[i];cols.push(c.r,c.g,c.b);}
+    line.geometry.setColors(cols);
+    const g=line.geometry;
+    if(g.attributes){['instanceColorStart','instanceColorEnd','color'].forEach(n=>{if(g.attributes[n])g.attributes[n].needsUpdate=true;});}
+  }
+  const ev=findBreakthrough();
+  if(ev.kind==='break'){
+    const grp=new THREE.Group();grp.name='cloudOverlay';
+    const p=enu(ev.s.lat,ev.s.lon,ev.s.h);
+    const d=dotSprite('#9effc2',0.028);d.position.copy(p);grp.add(d);
+    const lab=makeLabel('breaks through clouds ~T'+fmtT(ev.s.t)+' / alt '+ev.s.h.toFixed(1)+' km','#9effc2',1.0);
+    lab.position.copy(p);grp.add(lab);
+    pathGroup.add(grp);
+  }
+}
+function renderCloudPanel(){
+  const nums=$('cloudNums'), hour=$('cloudHour'), br=$('cloudBreak');
+  if(!nums||!hour||!br)return;
+  if(!cloudState){nums.textContent='L — · M — · H —';hour.textContent='Forecast unavailable';br.textContent='Clouds not loaded — path unshaded';return;}
+  const view=interpCloud(ORIGIN.lat,ORIGIN.lon)||cloudState.points[0];
+  const pct=v=>Math.round(v)+'%';
+  nums.textContent=`L ${pct(view.low)} · M ${pct(view.mid)} · H ${pct(view.high)}`;
+  const iso=cloudState.iso, [date,tim]=(iso||'').split('T');
+  const nice=tim?(tim.slice(0,5)+' CT'+(date?' · '+date.slice(5):'')):'catch hour';
+  hour.textContent=nice;
+  const ev=findBreakthrough();
+  const maxLow=Math.max(...cloudState.points.map(p=>p.low));
+  const maxMid=Math.max(...cloudState.points.map(p=>p.mid));
+  const maxHigh=Math.max(...cloudState.points.map(p=>p.high));
+  const nearClear=view.low<=CLOUD_THRESH&&view.mid<=CLOUD_THRESH&&view.high<=CLOUD_THRESH;
+  if(ev.kind==='clear')br.textContent='Sky clear — ship expected visible';
+  else if(ev.kind==='break'){
+    br.textContent='Breaks through ~T'+fmtT(ev.s.t)+' / '+ev.s.h.toFixed(1)+' km'+(nearClear?' · near pad mostly clear':'');
+  }else if(ev.kind==='hidden')br.textContent=ev.base!=null&&ev.base<=0.05?'Likely in cloud until catch':'Likely hidden along the return';
+  else br.textContent='—';
+  if(nearClear&&(maxLow>CLOUD_THRESH||maxMid>CLOUD_THRESH||maxHigh>CLOUD_THRESH)&&ev.kind!=='break'){
+    br.textContent='Near pad mostly clear; some cloud up-range';
+  }
+}
+async function loadClouds(){
+  const hour=$('cloudHour'), btn=$('btnClouds');
+  if(hour)hour.textContent='Loading forecast…';
+  if(btn)btn.disabled=true;
+  try{
+    const points=cloudQueryPoints();
+    const ms=catchEpoch, d=new Date(ms);
+    const ymd=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
+    const hourly=['cloud_cover','cloud_cover_low','cloud_cover_mid','cloud_cover_high','freezing_level_height',
+      'cloud_cover_1000hPa','cloud_cover_850hPa','cloud_cover_700hPa','cloud_cover_500hPa','cloud_cover_300hPa',
+      'geopotential_height_1000hPa','geopotential_height_850hPa','geopotential_height_700hPa','geopotential_height_500hPa','geopotential_height_300hPa'].join(',');
+    const url='https://api.open-meteo.com/v1/forecast?latitude='+points.map(p=>p.lat).join(',')+'&longitude='+points.map(p=>p.lon).join(',')+'&hourly='+hourly+'&timezone=America%2FChicago&start_date='+ymd+'&end_date='+ymd;
+    const ac=new AbortController();const to=setTimeout(()=>ac.abort(),12000);
+    const res=await fetch(url,{signal:ac.signal});clearTimeout(to);
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    if(data&&data.error)throw new Error(data.reason||'forecast error');
+    cloudState=parseClouds(data,points);
+    cloudState.url=url;cloudState.queryPts=points;
+    renderCloudPanel();applyCloudVisuals();
+  }catch(err){
+    console.warn('cloud forecast failed',err);
+    cloudState=null;renderCloudPanel();applyCloudVisuals();
+  }finally{if(btn)btn.disabled=false;}
+}
+$('btnClouds').onclick=e=>{e.stopPropagation();loadClouds();};
+loadClouds();
+
+window.__f15={SAMPLES,sampleAt,EVENTS,phone:PHONE,get clouds(){return cloudState;},loadClouds};
+
 </script>
 </body>
 </html>
